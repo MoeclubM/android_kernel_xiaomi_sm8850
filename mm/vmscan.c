@@ -1134,6 +1134,7 @@ retry:
 		unsigned int nr_pages;
 		bool activate = false;
 		bool keep = false;
+		bool bypass = false;
 
 		cond_resched();
 
@@ -1142,6 +1143,21 @@ retry:
 
 		if (!folio_trylock(folio))
 			goto keep;
+
+		if (folio_contain_hwpoisoned_page(folio)) {
+			/*
+			 * unmap_poisoned_folio() can't handle large
+			 * folio, just skip it. memory_failure() will
+			 * handle it if the UCE is triggered again.
+			 */
+			if (folio_test_large(folio))
+				goto keep_locked;
+
+			unmap_poisoned_folio(folio, folio_pfn(folio), false);
+			folio_unlock(folio);
+			folio_put(folio);
+			continue;
+		}
 
 		VM_BUG_ON_FOLIO(folio_test_active(folio), folio);
 
@@ -1464,8 +1480,10 @@ retry:
 				}
 				stat->nr_pageout += nr_pages;
 
-				if (folio_test_writeback(folio))
+				if (folio_test_writeback(folio)) {
+					trace_android_vh_handle_folio_writeback(folio, &bypass);
 					goto keep;
+				}
 				if (folio_test_dirty(folio))
 					goto keep;
 
@@ -1587,7 +1605,9 @@ activate_locked:
 keep_locked:
 		folio_unlock(folio);
 keep:
-		list_add(&folio->lru, &ret_folios);
+		trace_android_vh_adjust_nr_reclaimed(folio, &nr_reclaimed);
+		if (!bypass)
+			list_add(&folio->lru, &ret_folios);
 		VM_BUG_ON_FOLIO(folio_test_lru(folio) ||
 				folio_test_unevictable(folio), folio);
 	}
@@ -1705,6 +1725,25 @@ static __always_inline void update_lru_sizes(struct lruvec *lruvec,
 
 }
 
+#ifdef CONFIG_CMA
+/*
+ * It is waste of effort to scan and reclaim CMA pages if it is not available
+ * for current allocation context. Kswapd can not be enrolled as it can not
+ * distinguish this scenario by using sc->gfp_mask = GFP_KERNEL
+ */
+static bool skip_cma(struct folio *folio, struct scan_control *sc)
+{
+	return !current_is_kswapd() &&
+			gfp_migratetype(sc->gfp_mask) != MIGRATE_MOVABLE &&
+			get_pageblock_migratetype(&folio->page) == MIGRATE_CMA;
+}
+#else
+static bool skip_cma(struct folio *folio, struct scan_control *sc)
+{
+	return false;
+}
+#endif
+
 /*
  * Isolating page from the lruvec to fill in @dst list by nr_to_scan times.
  *
@@ -1739,6 +1778,7 @@ static unsigned long isolate_lru_folios(unsigned long nr_to_scan,
 	unsigned long scan, total_scan, nr_pages;
 	LIST_HEAD(folios_skipped);
 	unsigned long nr_scanned_before = *nr_scanned;
+	bool bypass = false;
 
 	trace_android_vh_mm_isolate_priv_lru(nr_to_scan, lruvec, lru, dst, sc->reclaim_idx,
 					     sc->may_unmap, nr_scanned, &nr_taken);
@@ -1757,7 +1797,8 @@ static unsigned long isolate_lru_folios(unsigned long nr_to_scan,
 		nr_pages = folio_nr_pages(folio);
 		total_scan += nr_pages;
 
-		if (folio_zonenum(folio) > sc->reclaim_idx) {
+		if (folio_zonenum(folio) > sc->reclaim_idx ||
+				skip_cma(folio, sc)) {
 			nr_skipped[folio_zonenum(folio)] += nr_pages;
 			move_to = &folios_skipped;
 			goto move;
@@ -1774,6 +1815,11 @@ static unsigned long isolate_lru_folios(unsigned long nr_to_scan,
 
 		if (!folio_test_lru(folio))
 			goto move;
+
+		trace_android_vh_may_unmap_folio(lru, sc, folio, &bypass);
+		if (bypass)
+			goto move;
+
 		if (!sc->may_unmap && folio_mapped(folio))
 			goto move;
 
@@ -2380,6 +2426,7 @@ static void prepare_scan_control(pg_data_t *pgdat, struct scan_control *sc)
 {
 	unsigned long file;
 	struct lruvec *target_lruvec;
+	bool bypass = false;
 
 	if (lru_gen_enabled())
 		return;
@@ -2391,7 +2438,9 @@ static void prepare_scan_control(pg_data_t *pgdat, struct scan_control *sc)
 	 * most accurate stats here. We may switch to regular stats flushing
 	 * in the future once it is cheap enough.
 	 */
-	mem_cgroup_flush_stats_ratelimited(sc->target_mem_cgroup);
+	trace_android_vh_mem_cgroup_flush_stats_bypass(sc->target_mem_cgroup, &bypass);
+	if (!bypass)
+		mem_cgroup_flush_stats_ratelimited(sc->target_mem_cgroup);
 
 	/*
 	 * Determine the scan balance between anon and file LRUs.
@@ -4538,7 +4587,7 @@ static bool sort_folio(struct lruvec *lruvec, struct folio *folio, struct scan_c
 	}
 
 	/* ineligible */
-	if (!folio_test_lru(folio) || zone > sc->reclaim_idx) {
+	if (zone > sc->reclaim_idx) {
 		gen = folio_inc_gen(lruvec, folio, false);
 		list_move_tail(&folio->lru, &lrugen->folios[gen][type][zone]);
 		return true;
@@ -5874,6 +5923,11 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 				sc->priority == DEF_PRIORITY);
 
 	blk_start_plug(&plug);
+
+	trace_android_vh_reclaim_before_kswapd(&nr_reclaimed);
+	if (nr_reclaimed >= nr_to_reclaim)
+		goto out;
+
 	while (nr[LRU_INACTIVE_ANON] || nr[LRU_ACTIVE_FILE] ||
 					nr[LRU_INACTIVE_FILE]) {
 		unsigned long nr_anon, nr_file, percentage;
@@ -5943,6 +5997,8 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 		nr[lru] = targets[lru] * (100 - percentage) / 100;
 		nr[lru] -= min(nr[lru], nr_scanned);
 	}
+
+out:
 	blk_finish_plug(&plug);
 	sc->nr_reclaimed += nr_reclaimed;
 	trace_android_vh_rebalance_anon_lru_bypass(&bypass);
@@ -6914,6 +6970,9 @@ static bool pgdat_balanced(pg_data_t *pgdat, int order, int highest_zoneidx)
 			mark = promo_wmark_pages(zone);
 		else
 			mark = high_wmark_pages(zone);
+
+		trace_android_vh_mm_get_zone_mark(zone, &mark);
+
 		if (zone_watermark_ok_safe(zone, order, mark, highest_zoneidx))
 			return true;
 	}
@@ -7798,7 +7857,7 @@ int node_reclaim(struct pglist_data *pgdat, gfp_t gfp_mask, unsigned int order)
 		return NODE_RECLAIM_NOSCAN;
 
 	ret = __node_reclaim(pgdat, gfp_mask, order);
-	clear_bit(PGDAT_RECLAIM_LOCKED, &pgdat->flags);
+	clear_bit_unlock(PGDAT_RECLAIM_LOCKED, &pgdat->flags);
 
 	if (ret)
 		count_vm_event(PGSCAN_ZONE_RECLAIM_SUCCESS);

@@ -70,17 +70,24 @@ struct ScatterGatherEntry {
 }
 
 /// This entry specifies that a fixup should happen at `target_offset` of the
-/// buffer. If `skip` is nonzero, then the fixup is a `binder_fd_array_object`
-/// and is applied later. Otherwise if `skip` is zero, then the size of the
-/// fixup is `sizeof::<u64>()` and `pointer_value` is written to the buffer.
-struct PointerFixupEntry {
-    /// The number of bytes to skip, or zero for a `binder_buffer_object` fixup.
-    skip: usize,
-    /// The translated pointer to write when `skip` is zero.
-    pointer_value: u64,
-    /// The offset at which the value should be written. The offset is relative
-    /// to the original buffer.
-    target_offset: usize,
+/// buffer.
+enum PointerFixupEntry {
+    /// A fixup for a `binder_buffer_object`.
+    Fixup {
+        /// The translated pointer to write.
+        pointer_value: u64,
+        /// The offset at which the value should be written. The offset is relative
+        /// to the original buffer.
+        target_offset: usize,
+    },
+    /// A skip for a `binder_fd_array_object`.
+    Skip {
+        /// The number of bytes to skip.
+        skip: usize,
+        /// The offset at which the skip should happen. The offset is relative
+        /// to the original buffer.
+        target_offset: usize,
+    },
 }
 
 /// Return type of `apply_and_validate_fixup_in_parent`.
@@ -205,7 +212,7 @@ impl UnusedBufferSpace {
     /// into the buffer is returned.
     fn claim_next(&mut self, size: usize) -> Result<usize> {
         // We require every chunk to be aligned.
-        let size = ptr_align(size);
+        let size = ptr_align(size).ok_or(EINVAL)?;
         let new_offset = self.offset.checked_add(size).ok_or(EINVAL)?;
 
         if new_offset <= self.limit {
@@ -347,7 +354,7 @@ impl InnerThread {
             return Err(EINVAL);
         }
         // Find a new current transaction for this thread.
-        self.current_transaction = transaction.find_from(thread);
+        self.current_transaction = transaction.find_from(thread).cloned();
         Ok(transaction)
     }
 
@@ -492,11 +499,11 @@ impl Thread {
             );
         }
 
-        let mut t_opt = inner.current_transaction.clone();
+        let mut t_opt = inner.current_transaction.as_ref();
         while let Some(t) = t_opt {
             if Arc::ptr_eq(&t.from, self) {
                 t.debug_print_inner(m, "    outgoing transaction ");
-                t_opt = t.from_parent.clone();
+                t_opt = t.from_parent.as_ref();
             } else if Arc::ptr_eq(&t.to, &self.process) {
                 t.debug_print_inner(m, "    incoming transaction ");
                 t_opt = t.find_from(self);
@@ -882,8 +889,7 @@ impl Thread {
 
                     parent_entry.fixup_min_offset = info.new_min_offset;
                     parent_entry.pointer_fixups.push(
-                        PointerFixupEntry {
-                            skip: 0,
+                        PointerFixupEntry::Fixup {
                             pointer_value: buffer_ptr_in_user_space,
                             target_offset: info.target_offset,
                         },
@@ -927,9 +933,8 @@ impl Thread {
                 parent_entry
                     .pointer_fixups
                     .push(
-                        PointerFixupEntry {
+                        PointerFixupEntry::Skip {
                             skip: fds_len,
-                            pointer_value: 0,
                             target_offset: info.target_offset,
                         },
                         GFP_KERNEL,
@@ -989,17 +994,21 @@ impl Thread {
 
             let mut reader = UserSlice::new(sg_entry.sender_uaddr as _, sg_entry.length).reader();
             for fixup in &mut sg_entry.pointer_fixups {
-                let fixup_len = if fixup.skip == 0 {
-                    size_of::<u64>()
-                } else {
-                    fixup.skip
+                let (fixup_len, fixup_offset) = match fixup {
+                    PointerFixupEntry::Fixup { target_offset, .. } => {
+                        (size_of::<u64>(), *target_offset)
+                    }
+                    PointerFixupEntry::Skip {
+                        skip,
+                        target_offset,
+                    } => (*skip, *target_offset),
                 };
 
-                let target_offset_end = fixup.target_offset.checked_add(fixup_len).ok_or(EINVAL)?;
-                if fixup.target_offset < end_of_previous_fixup || offset_end < target_offset_end {
+                let target_offset_end = fixup_offset.checked_add(fixup_len).ok_or(EINVAL)?;
+                if fixup_offset < end_of_previous_fixup || offset_end < target_offset_end {
                     pr_warn!(
                         "Fixups oob {} {} {} {}",
-                        fixup.target_offset,
+                        fixup_offset,
                         end_of_previous_fixup,
                         offset_end,
                         target_offset_end
@@ -1008,13 +1017,13 @@ impl Thread {
                 }
 
                 let copy_off = end_of_previous_fixup;
-                let copy_len = fixup.target_offset - end_of_previous_fixup;
+                let copy_len = fixup_offset - end_of_previous_fixup;
                 if let Err(err) = alloc.copy_into(&mut reader, copy_off, copy_len) {
                     pr_warn!("Failed copying into alloc: {:?}", err);
                     return Err(err.into());
                 }
-                if fixup.skip == 0 {
-                    let res = alloc.write::<u64>(fixup.target_offset, &fixup.pointer_value);
+                if let PointerFixupEntry::Fixup { pointer_value, .. } = fixup {
+                    let res = alloc.write::<u64>(fixup_offset, pointer_value);
                     if let Err(err) = res {
                         pr_warn!("Failed copying ptr into alloc: {:?}", err);
                         return Err(err.into());
@@ -1066,15 +1075,15 @@ impl Thread {
         };
 
         let data_size = trd.data_size.try_into().map_err(|_| EINVAL)?;
-        let aligned_data_size = ptr_align(data_size);
+        let aligned_data_size = ptr_align(data_size).ok_or(EINVAL)?;
         let offsets_size = trd.offsets_size.try_into().map_err(|_| EINVAL)?;
-        let aligned_offsets_size = ptr_align(offsets_size);
+        let aligned_offsets_size = ptr_align(offsets_size).ok_or(EINVAL)?;
         let buffers_size = tr.buffers_size.try_into().map_err(|_| EINVAL)?;
-        let aligned_buffers_size = ptr_align(buffers_size);
-        let aligned_secctx_size = secctx
-            .as_ref()
-            .map(|(_, ctx)| ptr_align(ctx.len()))
-            .unwrap_or(0);
+        let aligned_buffers_size = ptr_align(buffers_size).ok_or(EINVAL)?;
+        let aligned_secctx_size = match secctx.as_ref() {
+            Some((_offset, ctx)) => ptr_align(ctx.len()).ok_or(EINVAL)?,
+            None => 0,
+        };
 
         // This guarantees that at least `sizeof(usize)` bytes will be allocated.
         let len = usize::max(
@@ -1234,7 +1243,7 @@ impl Thread {
         transaction: &DArc<Transaction>,
     ) -> bool {
         if let Ok(transaction) = &reply {
-            crate::trace::trace_transaction(true, &transaction);
+            crate::trace::trace_transaction(true, &transaction, Some(&self.task));
 
             transaction.set_outstanding(&mut self.process.inner.lock());
         }
@@ -1299,7 +1308,7 @@ impl Thread {
                 pr_warn!(
                     "Transaction failed: {:?} my_pid:{}",
                     err,
-                    self.process.task.pid_in_current_ns()
+                    self.process.pid_in_current_ns()
                 );
             }
 
@@ -1443,13 +1452,13 @@ impl Thread {
                 }
                 BC_FREE_BUFFER => {
                     let buffer = self.process.buffer_get(reader.read()?);
-                    if let Some(buffer) = &buffer {
+                    if let Some(buffer) = buffer {
                         if buffer.looper_need_return_on_free() {
                             self.inner.lock().looper_need_return = true;
                         }
                         crate::trace::trace_transaction_buffer_release(buffer.debug_id);
+                        drop(buffer);
                     }
-                    drop(buffer);
                 }
                 BC_INCREFS => {
                     self.process
@@ -1482,6 +1491,9 @@ impl Thread {
                 }
                 BC_ENTER_LOOPER => self.inner.lock().looper_enter(),
                 BC_EXIT_LOOPER => self.inner.lock().looper_exit(),
+                BC_REQUEST_FREEZE_NOTIFICATION => self.process.request_freeze_notif(&mut reader)?,
+                BC_CLEAR_FREEZE_NOTIFICATION => self.process.clear_freeze_notif(&mut reader)?,
+                BC_FREEZE_NOTIFICATION_DONE => self.process.freeze_notif_done(&mut reader)?,
 
                 // Fail if given an unknown error code.
                 // BC_ATTEMPT_ACQUIRE and BC_ACQUIRE_RESULT are no longer supported.
@@ -1581,7 +1593,7 @@ impl Thread {
                 pr_warn!(
                     "Write failure {:?} in pid:{}",
                     err,
-                    self.process.task.pid_in_current_ns()
+                    self.process.pid_in_current_ns()
                 );
                 req.read_consumed = 0;
                 writer.write(&req)?;
@@ -1598,7 +1610,7 @@ impl Thread {
                 pr_warn!(
                     "Read failure {:?} in pid:{}",
                     ret,
-                    self.process.task.pid_in_current_ns()
+                    self.process.pid_in_current_ns()
                 );
             }
         }
@@ -1611,7 +1623,7 @@ impl Thread {
         ret
     }
 
-    pub(crate) fn poll(&self, file: &File, table: &mut PollTable) -> (bool, u32) {
+    pub(crate) fn poll(&self, file: &File, table: PollTable<'_>) -> (bool, u32) {
         table.register_wait(file, &self.work_condvar);
         let mut inner = self.inner.lock();
         (inner.should_use_process_work_queue(), inner.poll())
@@ -1650,12 +1662,13 @@ impl Thread {
     pub(crate) fn release(self: &Arc<Self>) {
         self.inner.lock().is_dead = true;
 
+        self.work_condvar.clear();
+        self.unwind_transaction_stack();
+
         // Cancel all pending work items.
         while let Ok(Some(work)) = self.get_work_local(false) {
             work.into_arc().cancel();
         }
-
-        self.unwind_transaction_stack();
     }
 }
 

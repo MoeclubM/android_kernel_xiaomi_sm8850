@@ -21,7 +21,7 @@ use core::{
 };
 
 use kernel::{
-    alloc::allocator::Kmalloc,
+    alloc::allocator::KVmalloc,
     alloc::Allocator,
     bindings,
     error::Result,
@@ -282,7 +282,7 @@ impl ShrinkablePageRange {
     }
 
     /// Register a vma with this page range. Returns the size of the region.
-    pub(crate) fn register_with_vma(&self, vma: &virt::VmAreaNew) -> Result<usize> {
+    pub(crate) fn register_with_vma(&self, vma: &virt::VmaNew) -> Result<usize> {
         let num_bytes = usize::min(vma.end() - vma.start(), bindings::SZ_4M as usize);
         let num_pages = num_bytes >> PAGE_SHIFT;
 
@@ -297,7 +297,7 @@ impl ShrinkablePageRange {
 
         let layout = Layout::array::<PageInfo>(num_pages).map_err(|_| ENOMEM)?;
         // SAFETY: The layout has non-zero size.
-        let pages = Kmalloc::alloc(layout, GFP_KERNEL)?.cast::<PageInfo>();
+        let pages = KVmalloc::alloc(layout, GFP_KERNEL)?.cast::<PageInfo>();
 
         // SAFETY: This just initializes the pages array.
         unsafe {
@@ -317,7 +317,7 @@ impl ShrinkablePageRange {
             pr_debug!("Failed to register with vma: already registered");
             drop(inner);
             // SAFETY: The `pages` array was allocated with the same layout.
-            unsafe { Kmalloc::free(pages.cast(), layout) };
+            unsafe { KVmalloc::free(pages.cast(), layout) };
             return Err(EBUSY);
         }
 
@@ -647,7 +647,7 @@ impl PinnedDrop for ShrinkablePageRange {
         let layout = unsafe { Layout::array::<PageInfo>(size).unwrap_unchecked() };
 
         // SAFETY: The `pages` array was allocated with the same layout.
-        unsafe { Kmalloc::free(pages.cast(), layout) };
+        unsafe { KVmalloc::free(pages.cast(), layout) };
     }
 }
 
@@ -673,18 +673,9 @@ unsafe extern "C" fn rust_shrink_scan(
     let nr_to_scan = unsafe { (*sc).nr_to_scan };
     // SAFETY: Accessing the lru list is okay. Just an FFI call.
     unsafe {
-        extern "C" {
-            fn rust_shrink_free_page_wrap(
-                item: *mut bindings::list_head,
-                list: *mut bindings::list_lru_one,
-                lock: *mut bindings::spinlock_t,
-                cb_arg: *mut kernel::ffi::c_void,
-            ) -> bindings::lru_status;
-        }
-
         bindings::list_lru_walk(
             list_lru,
-            Some(rust_shrink_free_page_wrap),
+            Some(bindings::rust_shrink_free_page_wrap),
             ptr::null_mut(),
             nr_to_scan,
         )

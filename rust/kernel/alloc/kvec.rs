@@ -2,6 +2,9 @@
 
 //! Implementation of [`Vec`].
 
+// May not be needed in Rust 1.87.0 (pending beta backport).
+#![allow(clippy::ptr_eq)]
+
 use super::{
     allocator::{KVmalloc, Kmalloc, Vmalloc},
     layout::ArrayLayout,
@@ -851,7 +854,7 @@ where
     }
 }
 
-impl<T> Default for KVec<T> {
+impl<T, A: Allocator> Default for Vec<T, A> {
     #[inline]
     fn default() -> Self {
         Self::new()

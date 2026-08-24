@@ -122,7 +122,7 @@ impl Transaction {
             debug_id,
             target_node: Some(target_node),
             from_parent,
-            sender_euid: from.process.cred.euid(),
+            sender_euid: from.process.task.euid(),
             from: from.clone(),
             to,
             code: trd.code,
@@ -239,11 +239,11 @@ impl Transaction {
     }
 
     /// Searches in the transaction stack for a transaction originating at the given thread.
-    pub(crate) fn find_from(&self, thread: &Thread) -> Option<DArc<Transaction>> {
+    pub(crate) fn find_from(&self, thread: &Thread) -> Option<&DArc<Transaction>> {
         let mut it = &self.from_parent;
         while let Some(transaction) = it {
             if core::ptr::eq(thread, transaction.from.as_ref()) {
-                return Some(transaction.clone());
+                return Some(transaction);
             }
 
             it = &transaction.from_parent;
@@ -276,8 +276,6 @@ impl Transaction {
     ///
     /// Not used for replies.
     pub(crate) fn submit(self: DLArc<Self>) -> BinderResult {
-        crate::trace::trace_transaction(false, &self);
-
         // Defined before `process_inner` so that the destructor runs after releasing the lock.
         let mut _t_outdated;
 
@@ -289,7 +287,8 @@ impl Transaction {
 
         if oneway {
             if let Some(target_node) = self.target_node.clone() {
-                if process_inner.is_frozen {
+                crate::trace::trace_transaction(false, &self, None);
+                if process_inner.is_frozen.is_frozen() {
                     process_inner.async_recv = true;
                     if self.flags & TF_UPDATE_TXN != 0 {
                         if let Some(t_outdated) =
@@ -313,7 +312,7 @@ impl Transaction {
                     }
                 }
 
-                if process_inner.is_frozen {
+                if process_inner.is_frozen.is_frozen() {
                     return Err(BinderError::new_frozen_oneway());
                 } else {
                     return Ok(());
@@ -323,17 +322,19 @@ impl Transaction {
             }
         }
 
-        if process_inner.is_frozen {
+        if process_inner.is_frozen.is_frozen() {
             process_inner.sync_recv = true;
             return Err(BinderError::new_frozen());
         }
 
         let res = if let Some(thread) = self.find_target_thread() {
+            crate::trace::trace_transaction(false, &self, Some(&thread.task));
             match thread.push_work(self) {
                 PushWorkRes::Ok => Ok(()),
                 PushWorkRes::FailedDead(me) => Err((BinderError::new_dead(), me)),
             }
         } else {
+            crate::trace::trace_transaction(false, &self, None);
             process_inner.push_work(self)
         };
         drop(process_inner);
@@ -423,13 +424,13 @@ impl DeliverToRead for Transaction {
         tr.data.ptr.buffer = self.data_address as _;
         tr.offsets_size = self.offsets_size as _;
         if tr.offsets_size > 0 {
-            tr.data.ptr.offsets = (self.data_address + ptr_align(self.data_size)) as _;
+            tr.data.ptr.offsets = (self.data_address + ptr_align(self.data_size).unwrap()) as _;
         }
         tr.sender_euid = self.sender_euid.into_uid_in_current_ns();
         tr.sender_pid = 0;
         if self.target_node.is_some() && self.flags & TF_ONE_WAY == 0 {
             // Not a reply and not one-way.
-            tr.sender_pid = self.from.process.task.pid_in_current_ns();
+            tr.sender_pid = self.from.process.pid_in_current_ns();
         }
         let code = if self.target_node.is_none() {
             BR_REPLY
@@ -529,7 +530,7 @@ impl DeliverToRead for Transaction {
             prio_state.state = PriorityState::Abort;
             *self.saved_priority.lock() = prio_state.next;
         } else {
-            let task = &*self.to.task;
+            let task = &*to_thread.task;
             let mut saved_priority = self.saved_priority.lock();
             saved_priority.sched_policy = task.policy();
             saved_priority.prio = task.normal_prio();
