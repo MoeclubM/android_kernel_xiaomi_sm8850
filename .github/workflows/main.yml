@@ -18,6 +18,7 @@ jobs:
             {
               "project": "mi17_sm8850",
               "branch": "${{ github.ref_name }}",
+              "ksu_variant": "resukisu",
               "apply_susfs": "false",
               "apply_bbg": "false"
             }
