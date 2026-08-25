@@ -3,6 +3,21 @@ on:
   push:
     branches: [ main, resukisu, mksu, ksu ]
   workflow_dispatch:
+    inputs:
+      ksu_variant:
+        description: 'Build Mode (resukisu / lkm / default)'
+        required: false
+        default: 'resukisu'
+        type: choice
+        options:
+          - resukisu
+          - lkm
+          - default
+      custom_localversion:
+        description: 'Custom Localversion (defaults to Xiaomi stock format)'
+        required: false
+        default: '-android16-6-gb1493ec68d4a-abogki514973465-4k'
+        type: string
 jobs:
   trigger:
     runs-on: ubuntu-latest
@@ -17,5 +32,7 @@ jobs:
           client-payload: >-
             {
               "project": "mi17_sm8850",
-              "branch": "${{ github.ref_name }}"
+              "branch": "${{ github.ref_name }}",
+              "ksu_variant": "${{ inputs.ksu_variant || (github.ref_name == 'main' && 'resukisu' || github.ref_name) }}",
+              "custom_localversion": "${{ inputs.custom_localversion || '-android16-6-gb1493ec68d4a-abogki514973465-4k' }}"
             }
