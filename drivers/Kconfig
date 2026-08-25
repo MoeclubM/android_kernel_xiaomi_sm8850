@@ -247,5 +247,4 @@ source "drivers/dpll/Kconfig"
 
 source "drivers/rekernel/Kconfig"
 
-source "drivers/kernelsu/Kconfig"
 endmenu

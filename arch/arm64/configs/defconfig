@@ -7308,12 +7308,7 @@ CONFIG_RANDSTRUCT_NONE=y
 # end of Kernel hardening options
 
 #
-# Baseband Security Guard Configuration
 #
-CONFIG_BBG=y
-# CONFIG_BBG_BLOCK_BOOT is not set
-CONFIG_BBG_BLOCK_RECOVERY=y
-# end of Baseband Security Guard Configuration
 # end of Security options
 
 CONFIG_CRYPTO=y
