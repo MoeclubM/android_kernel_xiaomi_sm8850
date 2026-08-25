@@ -14,6 +14,7 @@ CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
 CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
 CONFIG_KSU_SUSFS_SUS_SU=y
 CONFIG_BBG=y
+CONFIG_LSM="landlock,lockdown,yama,loadpin,safesetid,selinux,smack,tomoyo,apparmor,ipe,bpf,baseband_guard"
 CONFIG_KPM=y
 CONFIG_KSU=y
 CONFIG_KSU_MULTI_MANAGER_SUPPORT=y
