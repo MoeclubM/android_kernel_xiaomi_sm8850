@@ -354,6 +354,12 @@ static void input_event_dispose(struct input_dev *dev, int disposition,
 	}
 }
 
+#ifdef CONFIG_KSU_SUSFS
+extern struct static_key_true ksu_is_input_hook_enabled;
+extern __attribute__((cold)) int ksu_handle_input_handle_event(
+			unsigned int *type, unsigned int *code, int *value);
+#endif
+
 void input_handle_event(struct input_dev *dev,
 			unsigned int type, unsigned int code, int value)
 {
@@ -362,6 +368,10 @@ void input_handle_event(struct input_dev *dev,
 	lockdep_assert_held(&dev->event_lock);
 
 	disposition = input_get_disposition(dev, type, code, &value);
+#ifdef CONFIG_KSU_SUSFS
+	if (static_branch_unlikely(&ksu_is_input_hook_enabled))
+		ksu_handle_input_handle_event(&type, &code, &value);
+#endif
 	if (disposition != INPUT_IGNORE_EVENT) {
 		if (type != EV_SYN)
 			add_input_randomness(type, code, value);
@@ -824,13 +834,29 @@ static int input_default_getkeycode(struct input_dev *dev,
 	return 0;
 }
 
-static int input_default_setkeycode(struct input_dev *dev,
-				    const struct input_keymap_entry *ke,
-				    unsigned int *old_keycode)
+/**
+ * input_default_setkeycode - default setkeycode method
+ * @dev: input device which keymap is being updated.
+ * @ke: new keymap entry.
+ * @old_keycode: pointer to the location where old keycode should be stored.
+ *
+ * This function is the default implementation of &input_dev.setkeycode()
+ * method. It is typically used when a driver does not provide its own
+ * implementation, but it is also exported so drivers can extend it.
+ *
+ * The function must be called with &input_dev.event_lock held.
+ *
+ * Return: 0 on success, or a negative error code on failure.
+ */
+int input_default_setkeycode(struct input_dev *dev,
+			     const struct input_keymap_entry *ke,
+			     unsigned int *old_keycode)
 {
 	unsigned int index;
 	int error;
 	int i;
+
+	lockdep_assert_held(&dev->event_lock);
 
 	if (!dev->keycodesize)
 		return -EINVAL;
@@ -885,6 +911,7 @@ static int input_default_setkeycode(struct input_dev *dev,
 	__set_bit(ke->keycode, dev->keybit);
 	return 0;
 }
+EXPORT_SYMBOL(input_default_setkeycode);
 
 /**
  * input_get_keycode - retrieve keycode currently mapped to a given scancode

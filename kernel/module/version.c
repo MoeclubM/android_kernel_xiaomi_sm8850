@@ -32,15 +32,14 @@ int check_version(const struct load_info *info,
 				continue;
 			if (*version_ext.crc == *crc)
 				return 1;
-			pr_debug("Found checksum %X vs module %X\n",
-				 *crc, *version_ext.crc);
-			goto bad_version;
+			pr_warn_ratelimited("%s: symbol %s crc mismatch: kernel %08X vs module %08X (bypassing)\n",
+				info->name, symname, *crc, *version_ext.crc);
+			return 1;
 		}
 		pr_warn_once("%s: no extended symbol version for %s\n",
 			     info->name, symname);
 		return 1;
 	}
-
 	/* No versions at all?  modprobe --force does this. */
 	if (versindex == 0)
 		return try_to_force_load(mod, symname) == 0;
@@ -58,18 +57,15 @@ int check_version(const struct load_info *info,
 		crcval = *crc;
 		if (versions[i].crc == crcval)
 			return 1;
-		pr_debug("Found checksum %X vs module %lX\n",
-			 crcval, versions[i].crc);
-		goto bad_version;
+		pr_warn_ratelimited("%s: symbol %s crc mismatch: kernel %08X vs module %08lX (bypassing)\n",
+			info->name, symname, crcval, versions[i].crc);
+		return 1;
 	}
-
 	/* Broken toolchain. Warn once, then let it go.. */
 	pr_warn_once("%s: no symbol version for %s\n", info->name, symname);
 	return 1;
 
-bad_version:
-	pr_warn("%s: disagrees about version of symbol %s\n", info->name, symname);
-	return 0;
+	return 1;
 }
 
 int check_modstruct_version(const struct load_info *info,

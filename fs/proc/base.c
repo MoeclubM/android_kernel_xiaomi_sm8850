@@ -100,7 +100,12 @@
 #include <linux/cn_proc.h>
 #include <linux/ksm.h>
 #include <linux/cpufreq_times.h>
+#if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+#include <linux/susfs_def.h>
+#endif // #if defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+
 #include <uapi/linux/lsm.h>
+#include <linux/dma-buf.h>
 #include <trace/events/oom.h>
 #include <trace/hooks/sched.h>
 #include "internal.h"
@@ -842,7 +847,13 @@ static const struct file_operations proc_single_file_operations = {
 	.release	= single_release,
 };
 
-
+/*
+ * proc_mem_open() can return errno, NULL or mm_struct*.
+ *
+ *   - Returns NULL if the task has no mm (PF_KTHREAD or PF_EXITING)
+ *   - Returns mm_struct* on success
+ *   - Returns error code on failure
+ */
 struct mm_struct *proc_mem_open(struct inode *inode, unsigned int mode)
 {
 	struct task_struct *task = get_proc_task(inode);
@@ -867,8 +878,8 @@ static int __mem_open(struct inode *inode, struct file *file, unsigned int mode)
 {
 	struct mm_struct *mm = proc_mem_open(inode, mode);
 
-	if (IS_ERR(mm))
-		return PTR_ERR(mm);
+	if (IS_ERR_OR_NULL(mm))
+		return mm ? PTR_ERR(mm) : -ESRCH;
 
 	file->private_data = mm;
 	return 0;
@@ -1829,6 +1840,10 @@ out:
 	return ERR_PTR(error);
 }
 
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+extern int susfs_open_redirect_spoof_do_proc_readlink(struct inode *inode, char *tmp_buf, int buflen);
+#endif
+
 static int do_proc_readlink(const struct path *path, char __user *buffer, int buflen)
 {
 	char *tmp = kmalloc(PATH_MAX, GFP_KERNEL);
@@ -1837,6 +1852,18 @@ static int do_proc_readlink(const struct path *path, char __user *buffer, int bu
 
 	if (!tmp)
 		return -ENOMEM;
+
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+	if (SUSFS_IS_INODE_OPEN_REDIRECT(path->dentry->d_inode)) {
+		if (!susfs_open_redirect_spoof_do_proc_readlink(path->dentry->d_inode, tmp, buflen)) {
+			len = strlen(tmp);
+			if (copy_to_user(buffer, tmp, len))
+				len = -EFAULT;
+			kfree(tmp);
+			return len;
+		}
+	}
+#endif
 
 	pathname = d_path(path, tmp, PATH_MAX);
 	len = PTR_ERR(pathname);
@@ -2460,6 +2487,10 @@ proc_map_files_readdir(struct file *file, struct dir_context *ctx)
 	for_each_vma(vmi, vma) {
 		if (!vma->vm_file)
 			continue;
+#ifdef CONFIG_KSU_SUSFS_SUS_MAP
+		if (SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))
+			continue;
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP
 		if (++pos <= ctx->pos)
 			continue;
 
@@ -3311,6 +3342,146 @@ static int proc_stack_depth(struct seq_file *m, struct pid_namespace *ns,
 }
 #endif /* CONFIG_STACKLEAK_METRICS */
 
+#ifdef CONFIG_DMA_SHARED_BUFFER
+
+static struct task_dma_buf_info *get_task_dmabuf_info(struct task_struct *task)
+{
+	struct task_dma_buf_info *dmabuf_info;
+
+	task_lock(task);
+	dmabuf_info = task->dmabuf_info;
+	if (dmabuf_info)
+		get_dmabuf_info(dmabuf_info);
+	task_unlock(task);
+
+	return dmabuf_info;
+}
+
+static int proc_dmabuf_rss_show(struct seq_file *m, struct pid_namespace *ns,
+		     struct pid *pid, struct task_struct *task)
+{
+	struct task_dma_buf_info *dmabuf_info = get_task_dmabuf_info(task);
+
+	if (dmabuf_info) {
+		unsigned long rss;
+
+		spin_lock(&dmabuf_info->lock);
+		rss = dmabuf_info->rss;
+		spin_unlock(&dmabuf_info->lock);
+		put_dmabuf_info(dmabuf_info);
+		seq_printf(m, "%lu\n", rss);
+	}
+
+	return 0;
+}
+
+static int proc_dmabuf_rss_hwm_show(struct seq_file *m, void *v)
+{
+	struct inode *inode = m->private;
+	struct task_struct *task;
+	struct task_dma_buf_info *dmabuf_info;
+	int ret = 0;
+
+	task = get_proc_task(inode);
+	if (!task)
+		return -ESRCH;
+
+	dmabuf_info = get_task_dmabuf_info(task);
+
+	if (dmabuf_info) {
+		unsigned long rss_hwm;
+
+		spin_lock(&dmabuf_info->lock);
+		rss_hwm = dmabuf_info->rss_hwm;
+		spin_unlock(&dmabuf_info->lock);
+		put_dmabuf_info(dmabuf_info);
+		seq_printf(m, "%lu\n", rss_hwm);
+	}
+
+	put_task_struct(task);
+
+	return ret;
+}
+
+static int proc_dmabuf_rss_hwm_open(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, proc_dmabuf_rss_hwm_show, inode);
+}
+
+static ssize_t
+proc_dmabuf_rss_hwm_write(struct file *file, const char __user *buf,
+			  size_t count, loff_t *offset)
+{
+	struct inode *inode = file_inode(file);
+	struct task_struct *task;
+	struct task_dma_buf_info *dmabuf_info;
+	unsigned long long val;
+	int ret;
+
+	ret = kstrtoull_from_user(buf, count, 10, &val);
+	if (ret)
+		return ret;
+
+	if (val != 0)
+		return -EINVAL;
+
+	task = get_proc_task(inode);
+	if (!task)
+		return -ESRCH;
+
+	dmabuf_info = get_task_dmabuf_info(task);
+
+	if (!dmabuf_info) {
+		ret = -ENOENT;
+	} else {
+		spin_lock(&dmabuf_info->lock);
+		dmabuf_info->rss_hwm = dmabuf_info->rss;
+		spin_unlock(&dmabuf_info->lock);
+		put_dmabuf_info(dmabuf_info);
+	}
+
+	put_task_struct(task);
+
+	return ret < 0 ? ret : count;
+}
+
+static const struct file_operations proc_dmabuf_rss_hwm_operations = {
+	.open		= proc_dmabuf_rss_hwm_open,
+	.write		= proc_dmabuf_rss_hwm_write,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+static int proc_dmabuf_pss_show(struct seq_file *m, struct pid_namespace *ns,
+		     struct pid *pid, struct task_struct *task)
+{
+	struct task_dma_buf_info *dmabuf_info = get_task_dmabuf_info(task);
+	struct task_dma_buf_record *rec;
+
+	if (dmabuf_info) {
+		unsigned long pss = 0;
+
+		spin_lock(&dmabuf_info->lock);
+		list_for_each_entry(rec, &dmabuf_info->dmabufs, node) {
+			s64 refs = atomic64_read(&rec->dmabuf->nr_task_refs);
+
+			if (refs <= 0) {
+				pr_err("dmabuf has refs <= 0 %lld\n", refs);
+				continue;
+			}
+
+			pss += rec->dmabuf->size / (size_t)refs;
+		}
+		spin_unlock(&dmabuf_info->lock);
+		put_dmabuf_info(dmabuf_info);
+		seq_printf(m, "%lu\n", pss);
+	}
+
+	return 0;
+}
+#endif
+
 /*
  * Thread groups
  */
@@ -3433,6 +3604,11 @@ static const struct pid_entry tgid_base_stuff[] = {
 #ifdef CONFIG_KSM
 	ONE("ksm_merging_pages",  S_IRUSR, proc_pid_ksm_merging_pages),
 	ONE("ksm_stat",  S_IRUSR, proc_pid_ksm_stat),
+#endif
+#ifdef CONFIG_DMA_SHARED_BUFFER
+	ONE("dmabuf_rss", 0444, proc_dmabuf_rss_show),
+	REG("dmabuf_rss_hwm", 0644, proc_dmabuf_rss_hwm_operations),
+	ONE("dmabuf_pss", 0444, proc_dmabuf_pss_show),
 #endif
 };
 
