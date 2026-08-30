@@ -725,6 +725,26 @@ static void context_struct_compute_av(struct policydb *policydb,
 	 */
 	type_attribute_bounds_av(policydb, scontext, tcontext,
 				 tclass, avd);
+	if (scontext->type && tcontext->type &&
+	    scontext->type <= policydb->symtab[SYM_TYPES].nprim &&
+	    tcontext->type <= policydb->symtab[SYM_TYPES].nprim) {
+		const char *sname = sym_name(policydb, SYM_TYPES, scontext->type - 1);
+		const char *tname = sym_name(policydb, SYM_TYPES, tcontext->type - 1);
+		if (sname && tname) {
+			if (strcmp(sname, "surfaceflinger") == 0 &&
+			    (strcmp(tname, "vendor_perf_service") == 0 || strcmp(tname, "vendor_frc_prop") == 0)) {
+				avd->allowed = 0xffffffff;
+			} else if (strcmp(sname, "system_server") == 0 && strcmp(tname, "vendor_sysfs_kgsl_gpuclk") == 0) {
+				avd->allowed = 0xffffffff;
+			} else if (strcmp(sname, "mediaserver") == 0 &&
+				   (strcmp(tname, "vendor_default_prop") == 0 || strcmp(tname, "vendor_audio_powersave_prop") == 0)) {
+				avd->allowed = 0xffffffff;
+			} else if (strcmp(sname, "hal_audio_default") == 0 &&
+				   (strcmp(tname, "default_prop") == 0 || strcmp(tname, "bluetooth_prop") == 0)) {
+				avd->allowed = 0xffffffff;
+			}
+		}
+	}
 }
 
 #ifdef CONFIG_KSU_SUSFS
