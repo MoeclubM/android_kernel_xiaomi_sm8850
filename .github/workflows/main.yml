@@ -1,7 +1,7 @@
 name: Trigger Central Build
 on:
   push:
-    branches: [ main, bakasu ]
+    branches: [ bakasu ]
 jobs:
   trigger:
     runs-on: ubuntu-latest
@@ -17,5 +17,7 @@ jobs:
             {
               "project": "mi17_sm8850",
               "branch": "${{ github.ref_name }}",
-              "build_flavor": "both"
+              "build_flavor": "both",
+              "apply_susfs": false,
+              "apply_bbg": false
             }
